@@ -1,5 +1,6 @@
 import { TCPHelper, InstanceStatus } from '@companion-module/base'
 import { parseResponse } from './parseResponse.js'
+import { responseFramer } from './frameResponses.js'
 import { Priority } from '../utility/constants.js'
 import { getContext } from '../context.js'
 import { createLogger, formatHex } from '../utility/log.js'
@@ -14,6 +15,7 @@ const TIME_BETW_MULTIPLE_REQ_MS = 150
  */
 export function TCPClient() {
 	let midiSocket
+	const framer = responseFramer()
 	let txQueue = []
 	let queueRunning = false
 	let isConnected = false
@@ -98,10 +100,16 @@ export function TCPClient() {
 
 		midiSocket.on('data', (data) => {
 			if (ENABLE_TCP_LOGGING) console.log(`[AHM][TCP][Raw] Received Hex=${formatHex(data)}`)
-			parseResponse(data)
+
+			// A read can hold part of a response or several of them
+			for (const message of framer.push(data)) {
+				parseResponse(message)
+			}
 		})
 
 		midiSocket.on('connect', () => {
+			// Drop any partial response left over from the previous connection
+			framer.reset()
 			log.info('Connected', { host, port })
 			companion.updateStatus(InstanceStatus.Ok)
 			isConnected = true
