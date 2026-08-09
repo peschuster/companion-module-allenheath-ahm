@@ -7,6 +7,9 @@ import { createLogger, formatHex } from '../utility/log.js'
 const log = createLogger('TCP')
 const ENABLE_TCP_LOGGING = false
 const TIME_BETW_MULTIPLE_REQ_MS = 150
+// TCPHelper turns keepalive on but leaves the idle time at the OS default of 2 h, so an idle
+// connection to a dead peer only fails after that long
+const KEEPALIVE_IDLE_MS = 15000
 
 /**
  * TCP Client factory function. Creates TCP client and handles request queueing, sending, and receiving.
@@ -63,6 +66,25 @@ export function TCPClient() {
 	}
 
 	/**
+	 * Marks the connection as lost, clears pending requests, and notifies the disconnect callback.
+	 * Only the first call after a connect does anything, because TCPHelper keeps emitting 'error'
+	 * while its reconnect attempts fail.
+	 * @param {string} host
+	 * @param {number} port
+	 * @returns {void}
+	 */
+	function handleDisconnect(host, port) {
+		if (!isConnected) return
+
+		isConnected = false
+		clearQueue()
+		log.info('Disconnected', { host, port })
+		if (onDisconnectCallback) {
+			onDisconnectCallback()
+		}
+	}
+
+	/**
 	 * Creates a new TCP socket connection.
 	 * @param {string} host
 	 * @param {number} port
@@ -77,23 +99,20 @@ export function TCPClient() {
 
 		midiSocket = new TCPHelper(host, port)
 
+		midiSocket._socket.setKeepAlive(true, KEEPALIVE_IDLE_MS)
+
 		midiSocket.on('status_change', (status, message) => {
 			log.debug('StatusChanged', { status, message: message ?? '' })
 			companion.updateStatus(status)
 		})
 
-		midiSocket.on('close', () => {
-			isConnected = false
-			clearQueue()
-			log.info('Disconnected', { host, port })
-			if (onDisconnectCallback) {
-				onDisconnectCallback()
-			}
-		})
+		// TCPHelper has no 'close' event. A lost connection shows up as 'end' or 'error'.
+		midiSocket.on('end', () => handleDisconnect(host, port))
 
 		midiSocket.on('error', (err) => {
 			log.error('SocketError', { message: err.message })
 			companion.updateStatus(InstanceStatus.ConnectionFailure)
+			handleDisconnect(host, port)
 		})
 
 		midiSocket.on('data', (data) => {
@@ -137,6 +156,9 @@ export function TCPClient() {
 	 * @returns {void}
 	 */
 	function queue(buffers, priority = Priority.HIGH) {
+		// Drop requests while disconnected, otherwise they are sent late, after the reconnect
+		if (!isConnected) return
+
 		if (priority === Priority.HIGH) {
 			txQueue.unshift({ buffers, priority, timestamp: Date.now() })
 			if (cancelSleep) {
